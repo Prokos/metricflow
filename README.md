@@ -1,3 +1,11 @@
+# How to run:
+
+1. Ensure colima is installed and started
+2. Run `docker build -t metricflow-dev .`
+3. Run `docker run -it metricflow-dev`
+
+---
+
 <p align="center">
   <a target="_blank" href="https://transform.co/metricflow">
     <picture>

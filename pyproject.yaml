@@ -1,0 +1,8 @@
+# pyproject.yaml
+
+dependencies:
+  # Hatch is the build dependency management tool
+  # It should be installed before using it with 'hatch install'
+  hatch: '*'
+
+# Optionally, you can specify other project metadata or configuration here
