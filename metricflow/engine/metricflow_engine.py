@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Sequence, Tuple
+from typing import FrozenSet, List, Optional, Sequence, Tuple
 
 from dbt_semantic_interfaces.implementations.elements.dimension import PydanticDimensionTypeParams
 from dbt_semantic_interfaces.implementations.filters.where_filter import PydanticWhereFilter
@@ -39,9 +39,7 @@ from metricflow.dataflow.builder.dataflow_plan_builder import DataflowPlanBuilde
 from metricflow.dataflow.builder.node_data_set import DataflowPlanNodeOutputDataSetResolver
 from metricflow.dataflow.builder.source_node import SourceNodeBuilder
 from metricflow.dataflow.dataflow_plan import DataflowPlan
-from metricflow.dataflow.optimizer.source_scan.source_scan_optimizer import (
-    SourceScanOptimizer,
-)
+from metricflow.dataflow.optimizer.dataflow_optimizer_factory import DataflowPlanOptimization
 from metricflow.dataset.convert_semantic_model import SemanticModelToDataSetConverter
 from metricflow.dataset.dataset_classes import DataSet
 from metricflow.dataset.semantic_model_adapter import SemanticModelDataSet
@@ -115,6 +113,7 @@ class MetricFlowQueryRequest:
     order_by: Optional[Sequence[OrderByQueryParameter]] = None
     min_max_only: bool = False
     sql_optimization_level: SqlQueryOptimizationLevel = SqlQueryOptimizationLevel.O4
+    dataflow_plan_optimizations: FrozenSet[DataflowPlanOptimization] = DataflowPlanOptimization.all_optimizations()
     query_type: MetricFlowQueryType = MetricFlowQueryType.METRIC
 
     @staticmethod
@@ -131,6 +130,7 @@ class MetricFlowQueryRequest:
         order_by_names: Optional[Sequence[str]] = None,
         order_by: Optional[Sequence[OrderByQueryParameter]] = None,
         sql_optimization_level: SqlQueryOptimizationLevel = SqlQueryOptimizationLevel.O4,
+        dataflow_plan_optimizations: FrozenSet[DataflowPlanOptimization] = DataflowPlanOptimization.all_optimizations(),
         query_type: MetricFlowQueryType = MetricFlowQueryType.METRIC,
         min_max_only: bool = False,
     ) -> MetricFlowQueryRequest:
@@ -148,6 +148,7 @@ class MetricFlowQueryRequest:
             order_by_names=order_by_names,
             order_by=order_by,
             sql_optimization_level=sql_optimization_level,
+            dataflow_plan_optimizations=dataflow_plan_optimizations,
             query_type=query_type,
             min_max_only=min_max_only,
         )
@@ -502,10 +503,12 @@ class MetricFlowEngine(AbstractMetricFlowEngine):
             dataflow_plan = self._dataflow_plan_builder.build_plan(
                 query_spec=query_spec,
                 output_selection_specs=output_selection_specs,
-                optimizers=(SourceScanOptimizer(),),
+                optimizations=mf_query_request.dataflow_plan_optimizations,
             )
         else:
-            dataflow_plan = self._dataflow_plan_builder.build_plan_for_distinct_values(query_spec=query_spec)
+            dataflow_plan = self._dataflow_plan_builder.build_plan_for_distinct_values(
+                query_spec=query_spec, optimizations=mf_query_request.dataflow_plan_optimizations
+            )
 
         if len(dataflow_plan.sink_nodes) > 1:
             raise NotImplementedError(
@@ -608,10 +611,10 @@ class MetricFlowEngine(AbstractMetricFlowEngine):
                     )
                 else:
                     assert (
-                        linkable_dimension.semantic_model_origin
+                        linkable_dimension.defined_in_semantic_model
                     ), "Only metric_time can have no semantic_model_origin."
                     semantic_model = self._semantic_manifest_lookup.semantic_model_lookup.get_by_reference(
-                        linkable_dimension.semantic_model_origin
+                        linkable_dimension.defined_in_semantic_model
                     )
                     assert semantic_model
                     dimensions.append(
@@ -662,7 +665,7 @@ class MetricFlowEngine(AbstractMetricFlowEngine):
         ) in path_key_to_linkable_entities.items():
             for linkable_entity in linkable_entity_tuple:
                 semantic_model = self._semantic_manifest_lookup.semantic_model_lookup.get_by_reference(
-                    linkable_entity.semantic_model_origin
+                    linkable_entity.defined_in_semantic_model
                 )
                 assert semantic_model
                 entities.append(

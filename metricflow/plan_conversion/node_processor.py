@@ -3,15 +3,16 @@ from __future__ import annotations
 import dataclasses
 import logging
 from enum import Enum
-from typing import FrozenSet, List, Optional, Sequence, Set
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set
 
 from dbt_semantic_interfaces.enum_extension import assert_values_exhausted
-from dbt_semantic_interfaces.references import EntityReference, TimeDimensionReference
+from dbt_semantic_interfaces.references import EntityReference, SemanticModelReference, TimeDimensionReference
 from metricflow_semantics.filters.time_constraint import TimeRangeConstraint
 from metricflow_semantics.mf_logging.pretty_print import mf_pformat
+from metricflow_semantics.model.semantics.linkable_element import LinkableElementType
 from metricflow_semantics.model.semantics.semantic_model_join_evaluator import MAX_JOIN_HOPS
 from metricflow_semantics.model.semantics.semantic_model_lookup import SemanticModelLookup
-from metricflow_semantics.specs.spec_classes import LinkableInstanceSpec, LinklessEntitySpec
+from metricflow_semantics.specs.spec_classes import LinkableInstanceSpec, LinklessEntitySpec, WhereFilterSpec
 from metricflow_semantics.specs.spec_set import group_specs_by_type
 from metricflow_semantics.specs.spec_set_transforms import ToElementNameSet
 from metricflow_semantics.sql.sql_join_type import SqlJoinType
@@ -25,6 +26,7 @@ from metricflow.dataflow.nodes.constrain_time import ConstrainTimeRangeNode
 from metricflow.dataflow.nodes.filter_elements import FilterElementsNode
 from metricflow.dataflow.nodes.join_to_base import JoinDescription, JoinOnEntitiesNode
 from metricflow.dataflow.nodes.metric_time_transform import MetricTimeDimensionTransformNode
+from metricflow.dataflow.nodes.where_filter import WhereConstraintNode
 from metricflow.validation.dataflow_join_validator import JoinDataflowOutputValidator
 
 logger = logging.getLogger(__name__)
@@ -82,20 +84,27 @@ class PredicateInputType(Enum):
 class PredicatePushdownState:
     """Container class for maintaining state information relevant for predicate pushdown.
 
-    This broadly tracks two related items:
+    This broadly tracks three related items:
     1. Filter predicates collected during the process of constructing a dataflow plan
     2. Predicate types eligible for pushdown
+    3. Filters which have been applied already
 
-    The former may be updated as things like time constraints get altered or metric and measure filters are
+    The first may be updated as things like time constraints get altered or metric and measure filters are
     added to the query filters.
-    The latter may be updated based on query configuration, like if a cumulative metric is added to the plan
+    The second may be updated based on query configuration, like if a cumulative metric is added to the plan
     there may be changes to what sort of predicate pushdown operations are supported.
+    The last will be updated as filters are applied via pushdown or by the original WhereConstraintNode.
 
-    The time_range_constraint property holds the time window for setting up a time range filter expression.
+    Finally, the time_range_constraint property holds the time window for setting up a time range filter expression.
     """
 
     time_range_constraint: Optional[TimeRangeConstraint]
-    pushdown_enabled_types: FrozenSet[PredicateInputType] = frozenset([PredicateInputType.TIME_RANGE_CONSTRAINT])
+    # TODO: Deduplicate where_filter_specs
+    where_filter_specs: Sequence[WhereFilterSpec]
+    applied_where_filter_specs: FrozenSet[WhereFilterSpec] = frozenset()
+    pushdown_enabled_types: FrozenSet[PredicateInputType] = frozenset(
+        [PredicateInputType.TIME_RANGE_CONSTRAINT, PredicateInputType.CATEGORICAL_DIMENSION]
+    )
 
     def __post_init__(self) -> None:
         """Validation to ensure pushdown states are configured correctly.
@@ -107,13 +116,12 @@ class PredicatePushdownState:
         invalid_types: Set[PredicateInputType] = set()
 
         for input_type in self.pushdown_enabled_types:
-            if (
-                input_type is PredicateInputType.CATEGORICAL_DIMENSION
-                or input_type is PredicateInputType.ENTITY
-                or input_type is PredicateInputType.TIME_DIMENSION
-            ):
+            if input_type is PredicateInputType.ENTITY or input_type is PredicateInputType.TIME_DIMENSION:
                 invalid_types.add(input_type)
-            elif input_type is PredicateInputType.TIME_RANGE_CONSTRAINT:
+            elif (
+                input_type is PredicateInputType.CATEGORICAL_DIMENSION
+                or input_type is PredicateInputType.TIME_RANGE_CONSTRAINT
+            ):
                 continue
             else:
                 assert_values_exhausted(input_type)
@@ -125,23 +133,24 @@ class PredicatePushdownState:
             f"for {self.pushdown_enabled_types}, which includes the following invalid types: {invalid_types}."
         )
 
-        # TODO: Include where filter specs when they are added to this class
         time_range_constraint_is_valid = (
             self.time_range_constraint is None
             or PredicateInputType.TIME_RANGE_CONSTRAINT in self.pushdown_enabled_types
         )
-        assert time_range_constraint_is_valid, (
+        where_filter_specs_are_valid = len(self.where_filter_specs) == 0 or self.where_filter_pushdown_enabled
+        assert time_range_constraint_is_valid and where_filter_specs_are_valid, (
             "Invalid pushdown state configuration! Disabled pushdown state objects cannot have properties "
             "set that may lead to improper access and use in other contexts, as that can lead to unintended "
             "filtering operations in cases where these properties are accessed without appropriate checks against "
-            "pushdown configuration. The following properties should all have None values:\n"
-            f"time_range_constraint: {self.time_range_constraint}"
+            "pushdown configuration. The following properties should be None or empty:\n"
+            f"time_range_constraint: {self.time_range_constraint}\n"
+            f"where_filter_specs: {self.where_filter_specs}"
         )
 
     @property
     def has_pushdown_potential(self) -> bool:
         """Returns whether or not pushdown is enabled for a type with predicate candidates in place."""
-        return self.has_time_range_constraint_to_push_down
+        return self.has_time_range_constraint_to_push_down or self.has_where_filters_to_push_down
 
     @property
     def has_time_range_constraint_to_push_down(self) -> bool:
@@ -156,6 +165,44 @@ class PredicatePushdownState:
             and self.time_range_constraint is not None
         )
 
+    @property
+    def has_where_filters_to_push_down(self) -> bool:
+        """Convenience accessor for checking if there are any where filters to push down."""
+        return self.where_filter_pushdown_enabled and len(self.where_filter_specs) > 0
+
+    @property
+    def where_filter_pushdown_enabled(self) -> bool:
+        """Indicates whether or not pushdown is enabled for where filters."""
+        return (
+            PredicateInputType.CATEGORICAL_DIMENSION in self.pushdown_enabled_types
+            or PredicateInputType.ENTITY in self.pushdown_enabled_types
+            or PredicateInputType.TIME_DIMENSION in self.pushdown_enabled_types
+        )
+
+    @property
+    def pushdown_eligible_element_types(self) -> FrozenSet[LinkableElementType]:
+        """Set of linkable element types eligible for predicate pushdown.
+
+        This converts from enabled PushdownInputTypes for checking if linkable elements in where filter specs are
+        eligible for pushdown.
+        """
+        eligible_types: List[LinkableElementType] = []
+        for enabled_type in self.pushdown_enabled_types:
+            if enabled_type is PredicateInputType.TIME_RANGE_CONSTRAINT:
+                pass
+            elif enabled_type is PredicateInputType.CATEGORICAL_DIMENSION:
+                eligible_types.append(LinkableElementType.DIMENSION)
+            elif enabled_type is PredicateInputType.TIME_DIMENSION or enabled_type is PredicateInputType.ENTITY:
+                # TODO: Remove as support for time dimensions and entities becomes available
+                raise NotImplementedError(
+                    "Predicate pushdown is not currently supported for where filter predicates with time dimension or "
+                    f"entity references, but this pushdown state is enabled for {enabled_type}."
+                )
+            else:
+                assert_values_exhausted(enabled_type)
+
+        return frozenset(eligible_types)
+
     @staticmethod
     def with_time_range_constraint(
         original_pushdown_state: PredicatePushdownState, time_range_constraint: TimeRangeConstraint
@@ -169,18 +216,78 @@ class PredicatePushdownState:
             {PredicateInputType.TIME_RANGE_CONSTRAINT}
         )
         return PredicatePushdownState(
-            time_range_constraint=time_range_constraint, pushdown_enabled_types=pushdown_enabled_types
+            time_range_constraint=time_range_constraint,
+            pushdown_enabled_types=pushdown_enabled_types,
+            where_filter_specs=original_pushdown_state.where_filter_specs,
+            applied_where_filter_specs=original_pushdown_state.applied_where_filter_specs,
         )
 
     @staticmethod
     def without_time_range_constraint(
         original_pushdown_state: PredicatePushdownState,
     ) -> PredicatePushdownState:
-        """Factory method for updating pushdown state to bypass time range constraints."""
+        """Factory method for updating pushdown state to bypass time range constraints.
+
+        This eliminates time range constraint pushdown as an option, since the only reason to remove
+        time range constraint metadata is to turn it off, so we avoid potential issues where
+        a second ConstrainTimeRange node might update the pushdown state.
+
+        TODO: replace or rename this method.
+        """
         pushdown_enabled_types = original_pushdown_state.pushdown_enabled_types.difference(
             {PredicateInputType.TIME_RANGE_CONSTRAINT}
         )
-        return PredicatePushdownState(time_range_constraint=None, pushdown_enabled_types=pushdown_enabled_types)
+        return PredicatePushdownState(
+            time_range_constraint=None,
+            pushdown_enabled_types=pushdown_enabled_types,
+            where_filter_specs=original_pushdown_state.where_filter_specs,
+            applied_where_filter_specs=original_pushdown_state.applied_where_filter_specs,
+        )
+
+    @staticmethod
+    def without_where_filter_specs(
+        original_pushdown_state: PredicatePushdownState,
+    ) -> PredicatePushdownState:
+        """Factory method for updating pushdown state to remove existing where filter specs.
+
+        This simply blanks out the where filter specs without altering which types of pushdown are available.
+        """
+        return PredicatePushdownState.with_where_filter_specs(
+            original_pushdown_state=original_pushdown_state,
+            where_filter_specs=tuple(),
+        )
+
+    @staticmethod
+    def with_where_filter_specs(
+        original_pushdown_state: PredicatePushdownState, where_filter_specs: Sequence[WhereFilterSpec]
+    ) -> PredicatePushdownState:
+        """Factory method for replacing WhereFilterSpecs in pushdown operations.
+
+        This requires that the PushdownState allow for where filters - time range only or disabled states will raise
+        an exception, and must be checked externally.
+        """
+        return PredicatePushdownState(
+            time_range_constraint=original_pushdown_state.time_range_constraint,
+            where_filter_specs=where_filter_specs,
+            pushdown_enabled_types=original_pushdown_state.pushdown_enabled_types,
+            applied_where_filter_specs=original_pushdown_state.applied_where_filter_specs,
+        )
+
+    @staticmethod
+    def with_pushdown_applied_where_filter_specs(
+        original_pushdown_state: PredicatePushdownState, pushdown_applied_where_filter_specs: FrozenSet[WhereFilterSpec]
+    ) -> PredicatePushdownState:
+        """Factory method for replacing pushdown applied where filter specs in pushdown operations.
+
+        This is useful for managing propagation - both forwards and backwards - of where filter specs that have been
+        applied via a pushdown operation.
+        """
+        return PredicatePushdownState(
+            time_range_constraint=original_pushdown_state.time_range_constraint,
+            pushdown_enabled_types=original_pushdown_state.pushdown_enabled_types,
+            where_filter_specs=original_pushdown_state.where_filter_specs,
+            applied_where_filter_specs=pushdown_applied_where_filter_specs,
+        )
 
     @staticmethod
     def with_pushdown_disabled() -> PredicatePushdownState:
@@ -194,6 +301,7 @@ class PredicatePushdownState:
         return PredicatePushdownState(
             time_range_constraint=None,
             pushdown_enabled_types=frozenset(),
+            where_filter_specs=tuple(),
         )
 
 
@@ -240,6 +348,13 @@ class PreJoinNodeProcessor:
                 time_range_constraint=predicate_pushdown_state.time_range_constraint,
             )
 
+        if predicate_pushdown_state.has_where_filters_to_push_down:
+            source_nodes = self._add_where_constraint(
+                source_nodes=source_nodes,
+                where_filter_specs=predicate_pushdown_state.where_filter_specs,
+                enabled_element_types=predicate_pushdown_state.pushdown_eligible_element_types,
+            )
+
         return source_nodes
 
     def _add_time_range_constraint(
@@ -271,6 +386,47 @@ class PreJoinNodeProcessor:
             else:
                 processed_nodes.append(source_node)
         return processed_nodes
+
+    def _add_where_constraint(
+        self,
+        source_nodes: Sequence[DataflowPlanNode],
+        where_filter_specs: Sequence[WhereFilterSpec],
+        enabled_element_types: FrozenSet[LinkableElementType],
+    ) -> Sequence[DataflowPlanNode]:
+        """Processes where filter specs and evaluates their fitness for pushdown against the provided node set."""
+        eligible_filter_specs_by_model: Dict[SemanticModelReference, Sequence[WhereFilterSpec]] = {}
+        for spec in where_filter_specs:
+            semantic_models = set(element.semantic_model_origin for element in spec.linkable_elements)
+            invalid_element_types = [
+                element for element in spec.linkable_elements if element.element_type not in enabled_element_types
+            ]
+            if len(semantic_models) == 1 and len(invalid_element_types) == 0:
+                model = semantic_models.pop()
+                eligible_filter_specs_by_model[model] = tuple(eligible_filter_specs_by_model.get(model, tuple())) + (
+                    spec,
+                )
+
+        filtered_nodes: List[DataflowPlanNode] = []
+        for source_node in source_nodes:
+            node_semantic_models = tuple(source_node.as_plan().source_semantic_models)
+            if len(node_semantic_models) == 1 and node_semantic_models[0] in eligible_filter_specs_by_model:
+                eligible_filter_specs = eligible_filter_specs_by_model[node_semantic_models[0]]
+                source_node_specs = self._node_data_set_resolver.get_output_data_set(source_node).instance_set.spec_set
+                matching_filter_specs = [
+                    filter_spec
+                    for filter_spec in eligible_filter_specs
+                    if all([spec in source_node_specs.linkable_specs for spec in filter_spec.linkable_specs])
+                ]
+                if len(matching_filter_specs) == 0:
+                    filtered_nodes.append(source_node)
+                else:
+                    filtered_nodes.append(
+                        WhereConstraintNode(parent_node=source_node, where_specs=matching_filter_specs)
+                    )
+            else:
+                filtered_nodes.append(source_node)
+
+        return filtered_nodes
 
     def _node_contains_entity(
         self,

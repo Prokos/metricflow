@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
 from dbt_semantic_interfaces.enum_extension import assert_values_exhausted
 from dbt_semantic_interfaces.implementations.metric import PydanticMetricTimeWindow
@@ -82,7 +82,10 @@ from metricflow.dataflow.nodes.where_filter import WhereConstraintNode
 from metricflow.dataflow.nodes.window_reaggregation_node import WindowReaggregationNode
 from metricflow.dataflow.nodes.write_to_data_table import WriteToResultDataTableNode
 from metricflow.dataflow.nodes.write_to_table import WriteToResultTableNode
-from metricflow.dataflow.optimizer.dataflow_plan_optimizer import DataflowPlanOptimizer
+from metricflow.dataflow.optimizer.dataflow_optimizer_factory import (
+    DataflowPlanOptimization,
+    DataflowPlanOptimizerFactory,
+)
 from metricflow.dataset.dataset_classes import DataSet
 from metricflow.plan_conversion.node_processor import (
     PredicateInputType,
@@ -143,7 +146,7 @@ class DataflowPlanBuilder:
         query_spec: MetricFlowQuerySpec,
         output_sql_table: Optional[SqlTable] = None,
         output_selection_specs: Optional[InstanceSpecSet] = None,
-        optimizers: Sequence[DataflowPlanOptimizer] = (),
+        optimizations: FrozenSet[DataflowPlanOptimization] = frozenset(),
     ) -> DataflowPlan:
         """Generate a plan for reading the results of a query with the given spec into a data_table or table."""
         # Workaround for a Pycharm type inspection issue with decorators.
@@ -152,7 +155,7 @@ class DataflowPlanBuilder:
             query_spec=query_spec,
             output_sql_table=output_sql_table,
             output_selection_specs=output_selection_specs,
-            optimizers=optimizers,
+            optimizations=optimizations,
         )
 
     def _build_query_output_node(
@@ -184,7 +187,11 @@ class DataflowPlanBuilder:
             )
         )
 
-        predicate_pushdown_state = PredicatePushdownState(time_range_constraint=query_spec.time_range_constraint)
+        predicate_pushdown_state = PredicatePushdownState(
+            time_range_constraint=query_spec.time_range_constraint,
+            where_filter_specs=(),
+            pushdown_enabled_types=frozenset({PredicateInputType.TIME_RANGE_CONSTRAINT}),
+        )
 
         return self._build_metrics_output_node(
             metric_specs=tuple(
@@ -206,7 +213,7 @@ class DataflowPlanBuilder:
         query_spec: MetricFlowQuerySpec,
         output_sql_table: Optional[SqlTable],
         output_selection_specs: Optional[InstanceSpecSet],
-        optimizers: Sequence[DataflowPlanOptimizer],
+        optimizations: FrozenSet[DataflowPlanOptimization],
     ) -> DataflowPlan:
         metrics_output_node = self._build_query_output_node(query_spec=query_spec)
 
@@ -220,7 +227,11 @@ class DataflowPlanBuilder:
 
         plan_id = DagId.from_id_prefix(StaticIdPrefix.DATAFLOW_PLAN_PREFIX)
         plan = DataflowPlan(sink_nodes=[sink_node], plan_id=plan_id)
-        for optimizer in optimizers:
+        return self._optimize_plan(plan, optimizations)
+
+    def _optimize_plan(self, plan: DataflowPlan, optimizations: FrozenSet[DataflowPlanOptimization]) -> DataflowPlan:
+        optimizer_factory = DataflowPlanOptimizerFactory(self._node_data_set_resolver)
+        for optimizer in optimizer_factory.get_optimizers(optimizations):
             logger.info(f"Applying {optimizer.__class__.__name__}")
             try:
                 plan = optimizer.optimize(plan)
@@ -251,6 +262,7 @@ class DataflowPlanBuilder:
         disabled_pushdown_state = PredicatePushdownState.with_pushdown_disabled()
         time_range_only_pushdown_state = PredicatePushdownState(
             time_range_constraint=predicate_pushdown_state.time_range_constraint,
+            where_filter_specs=tuple(),
             pushdown_enabled_types=frozenset([PredicateInputType.TIME_RANGE_CONSTRAINT]),
         )
 
@@ -495,15 +507,22 @@ class DataflowPlanBuilder:
             child_metric_offset_to_grain=metric_spec.offset_to_grain,
             cumulative_description=(
                 CumulativeMeasureDescription(
-                    cumulative_window=metric.type_params.window,
-                    cumulative_grain_to_date=metric.type_params.grain_to_date,
+                    cumulative_window=(
+                        metric.type_params.cumulative_type_params.window
+                        if metric.type_params.cumulative_type_params
+                        else None
+                    ),
+                    cumulative_grain_to_date=(
+                        metric.type_params.cumulative_type_params.grain_to_date
+                        if metric.type_params.cumulative_type_params
+                        else None
+                    ),
                 )
                 if metric.type is MetricType.CUMULATIVE
                 else None
             ),
             descendent_filter_specs=metric_spec.filter_specs,
         )
-
         logger.info(
             f"For\n{indent(mf_pformat(metric_spec))}"
             f"\nneeded measure is:"
@@ -560,6 +579,9 @@ class DataflowPlanBuilder:
 
             # If metric is offset, we'll apply where constraint after offset to avoid removing values
             # unexpectedly. Time constraint will be applied by INNER JOINing to time spine.
+            # We may consider encapsulating this in pushdown state later, but as of this moment pushdown
+            # is about post-join to pre-join for dimension access, and relies on the builder to collect
+            # predicates from query and metric specs and make them available at measure level.
             if not metric_spec.has_time_offset:
                 filter_specs.extend(metric_spec.filter_specs)
 
@@ -615,8 +637,7 @@ class DataflowPlanBuilder:
             )
 
             if len(metric_spec.filter_specs) > 0:
-                merged_where_filter = WhereFilterSpec.merge_iterable(metric_spec.filter_specs)
-                output_node = WhereConstraintNode(parent_node=output_node, where_constraint=merged_where_filter)
+                output_node = WhereConstraintNode(parent_node=output_node, where_specs=metric_spec.filter_specs)
             if not extraneous_linkable_specs.is_subset_of(queried_linkable_specs):
                 output_node = FilterElementsNode(
                     parent_node=output_node,
@@ -715,17 +736,21 @@ class DataflowPlanBuilder:
 
         return CombineAggregatedOutputsNode(parent_nodes=output_nodes)
 
-    def build_plan_for_distinct_values(self, query_spec: MetricFlowQuerySpec) -> DataflowPlan:
+    def build_plan_for_distinct_values(
+        self, query_spec: MetricFlowQuerySpec, optimizations: FrozenSet[DataflowPlanOptimization] = frozenset()
+    ) -> DataflowPlan:
         """Generate a plan that would get the distinct values of a linkable instance.
 
         e.g. distinct listing__country_latest for bookings by listing__country_latest
         """
         # Workaround for a Pycharm type inspection issue with decorators.
         # noinspection PyArgumentList
-        return self._build_plan_for_distinct_values(query_spec)
+        return self._build_plan_for_distinct_values(query_spec, optimizations=optimizations)
 
     @log_runtime()
-    def _build_plan_for_distinct_values(self, query_spec: MetricFlowQuerySpec) -> DataflowPlan:
+    def _build_plan_for_distinct_values(
+        self, query_spec: MetricFlowQuerySpec, optimizations: FrozenSet[DataflowPlanOptimization]
+    ) -> DataflowPlan:
         assert not query_spec.metric_specs, "Can't build distinct values plan with metrics."
         query_level_filter_specs: Sequence[WhereFilterSpec] = ()
         if query_spec.filter_intersection is not None and len(query_spec.filter_intersection.where_filters) > 0:
@@ -743,7 +768,9 @@ class DataflowPlanBuilder:
         required_linkable_specs, _ = self.__get_required_and_extraneous_linkable_specs(
             queried_linkable_specs=query_spec.linkable_specs, filter_specs=query_level_filter_specs
         )
-        predicate_pushdown_state = PredicatePushdownState(time_range_constraint=query_spec.time_range_constraint)
+        predicate_pushdown_state = PredicatePushdownState(
+            time_range_constraint=query_spec.time_range_constraint, where_filter_specs=query_level_filter_specs
+        )
         dataflow_recipe = self._find_dataflow_recipe(
             linkable_spec_set=required_linkable_specs, predicate_pushdown_state=predicate_pushdown_state
         )
@@ -755,9 +782,7 @@ class DataflowPlanBuilder:
             output_node = JoinOnEntitiesNode(left_node=output_node, join_targets=dataflow_recipe.join_targets)
 
         if len(query_level_filter_specs) > 0:
-            output_node = WhereConstraintNode(
-                parent_node=output_node, where_constraint=WhereFilterSpec.merge_iterable(query_level_filter_specs)
-            )
+            output_node = WhereConstraintNode(parent_node=output_node, where_specs=query_level_filter_specs)
         if query_spec.time_range_constraint:
             output_node = ConstrainTimeRangeNode(
                 parent_node=output_node, time_range_constraint=query_spec.time_range_constraint
@@ -774,7 +799,8 @@ class DataflowPlanBuilder:
             parent_node=output_node, order_by_specs=query_spec.order_by_specs, limit=query_spec.limit
         )
 
-        return DataflowPlan(sink_nodes=[sink_node])
+        plan = DataflowPlan(sink_nodes=[sink_node])
+        return self._optimize_plan(plan, optimizations)
 
     @staticmethod
     def build_sink_node(
@@ -946,7 +972,14 @@ class DataflowPlanBuilder:
             node_data_set_resolver=self._node_data_set_resolver,
         )
 
-        if predicate_pushdown_state.has_pushdown_potential:
+        if predicate_pushdown_state.has_pushdown_potential and default_join_type is not SqlJoinType.FULL_OUTER:
+            # TODO: encapsulate join type and distinct values state and eventually move this to a DataflowPlanOptimizer
+            # This works today because all of our subsequent join configuration operations preserve the join type
+            # as-is, or else switch it to a CROSS JOIN or INNER JOIN type, both of which are safe for predicate
+            # pushdown. However, there is currently no way to enforce that invariant, so we will need to move
+            # to a model where we evaluate the join nodes themselves and decide on whether or not to push down
+            # the predicate. This will be much more straightforward once we finish encapsulating our existing
+            # time range constraint pushdown controls into this mechanism.
             candidate_nodes_for_left_side_of_join = list(
                 node_processor.apply_matching_filter_predicates(
                     source_nodes=candidate_nodes_for_left_side_of_join,
@@ -1496,12 +1529,11 @@ class DataflowPlanBuilder:
             )
 
         pre_aggregate_node: DataflowPlanNode = cumulative_metric_constrained_node or unaggregated_measure_node
-        merged_where_filter_spec = WhereFilterSpec.merge_iterable(metric_input_measure_spec.filter_specs)
         if len(metric_input_measure_spec.filter_specs) > 0:
             # Apply where constraint on the node
             pre_aggregate_node = WhereConstraintNode(
                 parent_node=pre_aggregate_node,
-                where_constraint=merged_where_filter_spec,
+                where_specs=metric_input_measure_spec.filter_specs,
             )
 
         if non_additive_dimension_spec is not None:
@@ -1571,7 +1603,7 @@ class DataflowPlanBuilder:
             ]
             if len(queried_filter_specs) > 0:
                 output_node = WhereConstraintNode(
-                    parent_node=output_node, where_constraint=WhereFilterSpec.merge_iterable(queried_filter_specs)
+                    parent_node=output_node, where_specs=queried_filter_specs, always_apply=True
                 )
 
             # TODO: this will break if you query by agg_time_dimension but apply a time constraint on metric_time.

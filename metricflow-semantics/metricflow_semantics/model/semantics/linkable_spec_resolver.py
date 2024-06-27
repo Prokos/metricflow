@@ -72,7 +72,7 @@ def _generate_linkable_time_dimensions(
 
         linkable_dimensions.append(
             LinkableDimension(
-                semantic_model_origin=semantic_model_origin,
+                defined_in_semantic_model=semantic_model_origin,
                 element_name=dimension.reference.element_name,
                 dimension_type=DimensionType.TIME,
                 entity_links=entity_links,
@@ -88,7 +88,7 @@ def _generate_linkable_time_dimensions(
             if time_granularity.to_int() <= date_part.to_int():
                 linkable_dimensions.append(
                     LinkableDimension(
-                        semantic_model_origin=semantic_model_origin,
+                        defined_in_semantic_model=semantic_model_origin,
                         element_name=dimension.reference.element_name,
                         dimension_type=DimensionType.TIME,
                         entity_links=entity_links,
@@ -246,7 +246,10 @@ class ValidLinkableSpecResolver:
         metrics_to_check = [metric]
         while metrics_to_check:
             metric_to_check = metrics_to_check.pop()
-            if metric_to_check.type_params.window is not None or metric_to_check.type_params.grain_to_date is not None:
+            if metric_to_check.type_params.cumulative_type_params and (
+                metric_to_check.type_params.cumulative_type_params.window is not None
+                or metric_to_check.type_params.cumulative_type_params.grain_to_date is not None
+            ):
                 return True
             for input_metric in metric_to_check.input_metrics:
                 if input_metric.offset_window is not None or input_metric.offset_to_grain is not None:
@@ -328,7 +331,7 @@ class ValidLinkableSpecResolver:
         for entity in semantic_model.entities:
             linkable_entities.append(
                 LinkableEntity(
-                    semantic_model_origin=semantic_model.reference,
+                    defined_in_semantic_model=semantic_model.reference,
                     element_name=entity.reference.element_name,
                     entity_links=(),
                     join_path=SemanticModelJoinPath(
@@ -343,7 +346,7 @@ class ValidLinkableSpecResolver:
                     continue
                 linkable_entities.append(
                     LinkableEntity(
-                        semantic_model_origin=semantic_model.reference,
+                        defined_in_semantic_model=semantic_model.reference,
                         element_name=entity.reference.element_name,
                         entity_links=(entity_link,),
                         join_path=SemanticModelJoinPath(
@@ -360,7 +363,7 @@ class ValidLinkableSpecResolver:
                 if dimension_type is DimensionType.CATEGORICAL:
                     linkable_dimensions.append(
                         LinkableDimension(
-                            semantic_model_origin=semantic_model.reference,
+                            defined_in_semantic_model=semantic_model.reference,
                             element_name=dimension.reference.element_name,
                             dimension_type=DimensionType.CATEGORICAL,
                             entity_links=(entity_link,),
@@ -492,14 +495,16 @@ class ValidLinkableSpecResolver:
                 )
                 path_key_to_linkable_dimensions[path_key].append(
                     LinkableDimension(
-                        semantic_model_origin=measure_semantic_model.reference if measure_semantic_model else None,
+                        defined_in_semantic_model=measure_semantic_model.reference if measure_semantic_model else None,
                         element_name=MetricFlowReservedKeywords.METRIC_TIME.value,
                         dimension_type=DimensionType.TIME,
                         entity_links=(),
                         join_path=SemanticModelJoinPath(
-                            left_semantic_model_reference=measure_semantic_model.reference
-                            if measure_semantic_model
-                            else SemanticModelDerivation.VIRTUAL_SEMANTIC_MODEL_REFERENCE,
+                            left_semantic_model_reference=(
+                                measure_semantic_model.reference
+                                if measure_semantic_model
+                                else SemanticModelDerivation.VIRTUAL_SEMANTIC_MODEL_REFERENCE
+                            ),
                         ),
                         # Anything that's not at the base time granularity of the measure's aggregation time dimension
                         # should be considered derived.
@@ -717,7 +722,7 @@ class ValidLinkableSpecResolver:
             if dimension_type == DimensionType.CATEGORICAL:
                 linkable_dimensions.append(
                     LinkableDimension(
-                        semantic_model_origin=semantic_model.reference,
+                        defined_in_semantic_model=semantic_model.reference,
                         element_name=dimension.reference.element_name,
                         dimension_type=DimensionType.CATEGORICAL,
                         entity_links=join_path.entity_links,
@@ -745,7 +750,7 @@ class ValidLinkableSpecResolver:
             if entity.reference != join_path.last_entity_link:
                 linkable_entities.append(
                     LinkableEntity(
-                        semantic_model_origin=semantic_model.reference,
+                        defined_in_semantic_model=semantic_model.reference,
                         element_name=entity.reference.element_name,
                         entity_links=join_path.entity_links,
                         join_path=join_path,

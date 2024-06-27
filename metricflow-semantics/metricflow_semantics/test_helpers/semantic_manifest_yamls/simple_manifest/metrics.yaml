@@ -135,7 +135,9 @@ metric:
   type: cumulative
   type_params:
     measure: txn_revenue
-    window: 2 month
+    cumulative_type_params:
+      window: 2 month
+      period_agg: average
 ---
 metric:
   name: "revenue_all_time"
@@ -143,6 +145,8 @@ metric:
   type: cumulative
   type_params:
     measure: txn_revenue
+    cumulative_type_params:
+      period_agg: last
 ---
 metric:
   name: "every_two_days_bookers"
@@ -158,7 +162,8 @@ metric:
   type: cumulative
   type_params:
     measure: txn_revenue
-    grain_to_date: month
+    cumulative_type_params:
+      grain_to_date: month
 ---
 metric:
   name: booking_fees
@@ -258,7 +263,8 @@ metric:
   name: instant_booking_fraction_of_max_value
   description: |
     Average instant booking value as a ratio of overall max booking value.
-    Tests constrained ratio measure.
+    Tests constrained ratio measure and predicate pushdown with different filters
+    on the same measure input.
   type: ratio
   type_params:
     numerator:
@@ -326,7 +332,8 @@ metric:
   name: regional_starting_balance_ratios
   description: |
     First day account balance ratio of western vs eastern region starting balance ratios,
-    used to test interaction between semi-additive measures and measure constraints
+    used to test interaction between semi-additive measures and measure constraints, and
+    behavior of predicate pushdown when there are multiple filters on the same categorical dimension
   type: ratio
   type_params:
     numerator:
@@ -629,7 +636,8 @@ metric:
       name: bookers
       join_to_timespine: true
       fill_nulls_with: 0
-    window: 2 days
+    cumulative_type_params:
+      window: 2 days
 ---
 metric:
   name: bookings_growth_2_weeks_fill_nulls_with_0
